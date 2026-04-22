@@ -1,25 +1,29 @@
 import os
 import sys
+
+# ================= 1. 核心环境劫持 (必须在导入所有包之前执行) =================
+if getattr(sys, 'frozen', False):
+    # 【生产环境】打包后的 exe 运行
+    PROG_DIR = os.path.dirname(sys.executable)
+else:
+    # 【开发环境】源码运行
+    PROG_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 【核心设定】：取消环境区分！无论是源码运行还是 exe，
+# 统统强制指向当前目录下的 pw-browsers 文件夹，实现真正的 100% 便携离线包。
+BROWSERS_PATH = os.path.join(PROG_DIR, "pw-browsers")
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_PATH
+
+
+# ================= 2. 依赖导入 =================
 import time
 import hashlib
 import requests
 import configparser
 import subprocess
 from datetime import datetime
+# [必须在此处导入] 此时再导入 Playwright，它才能正确读取到被我们篡改过的 PLAYWRIGHT_BROWSERS_PATH
 from playwright.sync_api import sync_playwright
-
-# ================= 1. 环境与配置自适应 =================
-if getattr(sys, 'frozen', False):
-    # 【生产环境】如果是打包后的 exe，获取 exe 所在的绝对目录
-    PROG_DIR = os.path.dirname(sys.executable)
-    # 仅在 exe 模式下，才强制重定向浏览器内核到本地文件夹，实现免安装便携化
-    BROWSERS_PATH = os.path.join(PROG_DIR, "pw-browsers")
-    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_PATH
-else:
-    # 【开发环境】如果是源码运行，获取 main.py 所在的绝对目录
-    PROG_DIR = os.path.dirname(os.path.abspath(__file__))
-    # 源码模式下不设置环境变量，让 Playwright 自动去读取你电脑里之前已经装好的全局浏览器内核
-    BROWSERS_PATH = None
 
 CONFIG_PATH = os.path.join(PROG_DIR, "config.ini")
 
@@ -34,7 +38,6 @@ def load_config():
     _config.read(CONFIG_PATH, encoding="utf-8")
     return _config
 
-# 加载配置变量
 try:
     conf = load_config()
     ACCOUNT = conf.get("Credentials", "account")
@@ -48,7 +51,8 @@ except Exception as e:
 
 BASE_URL = "http://sw.cesaas.com:81"
 
-# ================= 2. 核心业务类 =================
+
+# ================= 3. 核心业务类 =================
 class OrderHistoryRPA:
     def __init__(self):
         self.session = requests.Session()
@@ -56,10 +60,7 @@ class OrderHistoryRPA:
         self.headers = {"Content-Type": "application/json"}
 
     def login(self):
-        """登录并自动处理密码加密"""
         url = f"{BASE_URL}/admin/login/login"
-
-        # 自动将明文密码转化为 MD5 密文
         md5_obj = hashlib.md5()
         md5_obj.update(RAW_PASSWORD.encode('utf-8'))
         encrypted_pwd = md5_obj.hexdigest()
@@ -78,14 +79,13 @@ class OrderHistoryRPA:
             if resp.get("IsSuccess"):
                 self.token = resp["TModel"]["Token"]
                 self.headers["Authorization"] = f"Bearer {self.token}"
-                print("[+] 登录成功，获取到有效授权 Token")
+                print("[+] 登录成功")
             else:
                 raise Exception(resp.get("Message", "未知错误"))
         except Exception as e:
             raise Exception(f"登录接口连接失败: {e}")
 
     def fetch_all_tickets(self):
-        """获取全量工单，基于 PageCount 进行精确分页"""
         url = f"{BASE_URL}/workflow/order_history/List"
         all_items = []
         page_index = 1
@@ -114,7 +114,6 @@ class OrderHistoryRPA:
                 print(f"[!] 检索完成: 时间段内共发现 {record_count} 条工单，分 {total_pages} 页处理")
                 if record_count == 0: break
 
-            # 兼容多种返回结构的提取逻辑
             items = []
             t_model = resp.get("TModel")
             if isinstance(t_model, list):
@@ -129,8 +128,6 @@ class OrderHistoryRPA:
         return all_items
 
     def save_pdf(self, page, item):
-        """导出PDF并按责任原因分类"""
-        # 安全提取字段
         ticket_id = item.get("TicketId")
         category_id = item.get("CategoryId")
         ticket_no = str(item.get("TicketNo") or f"T{int(time.time())}").strip()
@@ -139,7 +136,6 @@ class OrderHistoryRPA:
 
         if not ticket_id: return
 
-        # 清洗非法字符，防止 Windows/Mac 建文件夹报错
         safe_resp = resp_name.replace('/', '_').replace('\\', '_')
         safe_reason = reason_one.replace('/', '_').replace('\\', '_')
 
@@ -151,7 +147,7 @@ class OrderHistoryRPA:
 
         try:
             page.goto(print_url, wait_until="networkidle", timeout=60000)
-            time.sleep(1) # 等待样式渲染
+            time.sleep(1)
             page.pdf(path=file_path, format="A4", print_background=True)
             print(f"    [成功] {safe_resp} > {safe_reason} > {ticket_no}")
         except Exception as e:
@@ -166,8 +162,12 @@ class OrderHistoryRPA:
 
         print(f"[+] 启动无头浏览器，准备下载 {len(tickets)} 份 PDF ...")
         with sync_playwright() as p:
-            # 兼容某些环境下的执行文件路径
-            browser = p.chromium.launch(headless=True)
+            # 精准拦截内核启动异常
+            try:
+                browser = p.chromium.launch(headless=True)
+            except Exception as e:
+                raise Exception(f"BROWSER_INIT_FAILED|{str(e)}")
+
             context = browser.new_context()
             page = context.new_page()
 
@@ -177,20 +177,19 @@ class OrderHistoryRPA:
 
             browser.close()
 
-# ================= 3. 执行入口与交互处理 =================
+
+# ================= 4. 执行入口与交互处理 =================
 def install_chromium():
-    """自动化安装 Chromium 浏览器内核"""
     try:
+        print(f"\n[*] 正在安装便携版 Chromium 浏览器组件到: {BROWSERS_PATH}")
+        print("[*] 文件体积较大（约 100MB+），请耐心等待...")
         if getattr(sys, 'frozen', False):
-            print(f"\n[*] 正在安装便携版 Chromium 浏览器组件到: {BROWSERS_PATH}")
-            print("[*] 文件体积较大（约 100MB+），请耐心等待...")
             from playwright._impl._driver import compute_driver_executable, get_driver_env
             env = get_driver_env()
             executable = compute_driver_executable()
             subprocess.check_call([executable, 'install', 'chromium'], env=env)
         else:
-            print(f"\n[*] 正在安装全局 Chromium 浏览器组件到系统默认目录...")
-            print("[*] 文件体积较大（约 100MB+），请耐心等待...")
+            # 源码环境下，强制下载到当前的 pw-browsers
             subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
         print("\n[+] 浏览器组件下载安装成功！")
     except Exception as e:
@@ -212,8 +211,9 @@ if __name__ == "__main__":
         print(f">>> 文件保存在: {os.path.join(PROG_DIR, '工单导出结果')}")
     except Exception as e:
         error_msg = str(e)
-        if "Executable doesn't exist" in error_msg or "playwright install" in error_msg:
-            print("\n[!] 运行中断：未检测到 Chromium 浏览器运行环境。")
+        # 依赖异常抛出的精确匹配，绝对拦截缺失事件
+        if "BROWSER_INIT_FAILED" in error_msg:
+            print("\n[!] 运行中断：未检测到 Chromium 浏览器内核或初始化失败。")
             choice = input("是否立即自动下载所需的浏览器组件？(Y/N): ").strip().upper()
             if choice == 'Y':
                 install_chromium()
