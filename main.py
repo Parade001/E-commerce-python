@@ -10,11 +10,16 @@ from playwright.sync_api import sync_playwright
 
 # ================= 1. 环境与配置自适应 =================
 if getattr(sys, 'frozen', False):
-    # 如果是打包后的 exe，获取 exe 所在的绝对目录
+    # 【生产环境】如果是打包后的 exe，获取 exe 所在的绝对目录
     PROG_DIR = os.path.dirname(sys.executable)
+    # 仅在 exe 模式下，才强制重定向浏览器内核到本地文件夹，实现免安装便携化
+    BROWSERS_PATH = os.path.join(PROG_DIR, "pw-browsers")
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_PATH
 else:
-    # 如果是源码运行，获取 main.py 所在的绝对目录
+    # 【开发环境】如果是源码运行，获取 main.py 所在的绝对目录
     PROG_DIR = os.path.dirname(os.path.abspath(__file__))
+    # 源码模式下不设置环境变量，让 Playwright 自动去读取你电脑里之前已经装好的全局浏览器内核
+    BROWSERS_PATH = None
 
 CONFIG_PATH = os.path.join(PROG_DIR, "config.ini")
 
@@ -97,7 +102,7 @@ class OrderHistoryRPA:
                     {"Field": "CategoryId", "Value": "(10,11,12,13,14,15,18,21,17)", "Operator": "in", "Connector": "and"},
                     {"Field": "CreateTimeStart", "Value": START_TIME, "Operator": ">=", "Connector": "and"},
                     {"Field": "CreateTimeEnd", "Value": END_TIME, "Operator": "<=", "Connector": "and"},
-                    {"Field": "MyTicket", "Value": 1, "Operator": "=", "Connector": "and"} # 0/1 根据抓包确定
+                    {"Field": "MyTicket", "Value": 1, "Operator": "=", "Connector": "and"}
                 ]
             }
 
@@ -173,12 +178,29 @@ class OrderHistoryRPA:
             browser.close()
 
 # ================= 3. 执行入口与交互处理 =================
+def install_chromium():
+    """自动化安装 Chromium 浏览器内核"""
+    try:
+        if getattr(sys, 'frozen', False):
+            print(f"\n[*] 正在安装便携版 Chromium 浏览器组件到: {BROWSERS_PATH}")
+            print("[*] 文件体积较大（约 100MB+），请耐心等待...")
+            from playwright._impl._driver import compute_driver_executable, get_driver_env
+            env = get_driver_env()
+            executable = compute_driver_executable()
+            subprocess.check_call([executable, 'install', 'chromium'], env=env)
+        else:
+            print(f"\n[*] 正在安装全局 Chromium 浏览器组件到系统默认目录...")
+            print("[*] 文件体积较大（约 100MB+），请耐心等待...")
+            subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+        print("\n[+] 浏览器组件下载安装成功！")
+    except Exception as e:
+        print(f"\n[致命错误] 浏览器安装失败: {e}")
+        print("提示：请检查网络连接，或尝试关闭系统代理后重试。")
+        sys.exit(1)
+
 if __name__ == "__main__":
-    # 支持命令行安装内核: exe install
     if len(sys.argv) > 1 and sys.argv[1] == "install":
-        print("[*] 正在安装 Chromium 浏览器组件，请稍后...")
-        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"])
-        print("[+] 安装成功！现在您可以直接运行程序了。")
+        install_chromium()
         input("\n按回车键退出...")
         sys.exit(0)
 
@@ -189,8 +211,16 @@ if __name__ == "__main__":
         print(">>> 导出任务全部完成！")
         print(f">>> 文件保存在: {os.path.join(PROG_DIR, '工单导出结果')}")
     except Exception as e:
-        print(f"\n[致命错误]: {e}")
-        print("\n提示：如果报错缺少浏览器可执行文件，请运行: 工单导出助手.exe install")
+        error_msg = str(e)
+        if "Executable doesn't exist" in error_msg or "playwright install" in error_msg:
+            print("\n[!] 运行中断：未检测到 Chromium 浏览器运行环境。")
+            choice = input("是否立即自动下载所需的浏览器组件？(Y/N): ").strip().upper()
+            if choice == 'Y':
+                install_chromium()
+                print("\n[!] 准备就绪，请重新运行本程序执行导出任务。")
+            else:
+                print("\n[!] 取消安装。如需手动安装，请在命令行执行: 你的程序.exe install")
+        else:
+            print(f"\n[致命错误]: {error_msg}")
 
-    # 防止双击运行时黑窗口直接消失
     input("\n程序执行结束，按回车键退出...")
