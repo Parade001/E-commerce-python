@@ -103,7 +103,7 @@ has_spell = 0
 在终端执行以下命令（注意使用 `--collect-all` 载入底层驱动）：
 
 ```bash
-pyinstaller -D main.py --collect-all playwright -n 工单导出助手
+pyinstaller --onefile --name 工单导出助手 main.py
 ```
 
 *编译完成后，会在 `dist` 目录下生成一个名为 `工单导出助手` 的大型文件夹。*
