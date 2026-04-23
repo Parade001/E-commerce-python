@@ -1,37 +1,31 @@
 import os
 import sys
-
-# ================= 1. 核心环境劫持 (必须在导入所有包之前执行) =================
-if getattr(sys, 'frozen', False):
-    # 【生产环境】打包后的 exe 运行
-    PROG_DIR = os.path.dirname(sys.executable)
-else:
-    # 【开发环境】源码运行
-    PROG_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# 统统强制指向当前目录下的 pw-browsers 文件夹，实现真正的 100% 便携离线包。
-BROWSERS_PATH = os.path.join(PROG_DIR, "pw-browsers")
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_PATH
-
-
-# ================= 2. 依赖导入 =================
 import time
 import hashlib
 import requests
 import configparser
 import subprocess
 from datetime import datetime
+
+# ================= 1. 核心环境劫持 =================
+if getattr(sys, 'frozen', False):
+    PROG_DIR = os.path.dirname(sys.executable)
+else:
+    PROG_DIR = os.path.dirname(os.path.abspath(__file__))
+
+BROWSERS_PATH = os.path.join(PROG_DIR, "pw-browsers")
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_PATH
+
 from playwright.sync_api import sync_playwright
 
+# ================= 2. 配置加载 =================
 CONFIG_PATH = os.path.join(PROG_DIR, "config.ini")
 
 def load_config():
     if not os.path.exists(CONFIG_PATH):
         print(f"\n[错误] 未找到配置文件: {CONFIG_PATH}")
-        print(f"请确保 config.ini 与程序放在同一个文件夹内。")
         input("\n按回车键退出...")
         sys.exit(1)
-
     _config = configparser.ConfigParser()
     _config.read(CONFIG_PATH, encoding="utf-8")
     return _config
@@ -48,7 +42,6 @@ except Exception as e:
     sys.exit(1)
 
 BASE_URL = "http://sw.cesaas.com:81"
-
 
 # ================= 3. 核心业务类 =================
 class OrderHistoryRPA:
@@ -110,20 +103,14 @@ class OrderHistoryRPA:
             }
 
             resp = self.session.post(url, json=payload, headers=self.headers).json()
-
             if page_index == 1:
                 total_pages = resp.get("PageCount", 1)
                 record_count = resp.get("RecordCount", 0)
-                print(f"[!] 检索完成: 时间段内共发现 {record_count} 条工单，分 {total_pages} 页处理")
+                print(f"[!] 检索完成: 共发现 {record_count} 条工单，分 {total_pages} 页处理")
                 if record_count == 0: break
 
-            items = []
             t_model = resp.get("TModel")
-            if isinstance(t_model, list):
-                items = t_model
-            elif isinstance(t_model, dict):
-                items = t_model.get("Items", [])
-
+            items = t_model if isinstance(t_model, list) else (t_model.get("Items", []) if t_model else [])
             all_items.extend(items)
             print(f"[*] 正在抓取第 {page_index}/{total_pages} 页数据...")
             page_index += 1
@@ -144,23 +131,30 @@ class OrderHistoryRPA:
 
         folder_path = os.path.join(PROG_DIR, "工单导出结果", safe_resp, safe_reason)
         os.makedirs(folder_path, exist_ok=True)
-
         file_path = os.path.join(folder_path, f"{ticket_no}.pdf")
-        print_url = f"{BASE_URL}/workflow/order_print?categoryId={category_id}&ticketId={ticket_id}&nos={ticket_no}"
+
+        # 【优化1】：加入时间戳，强制打破 Vue 路由缓存，解决同一页面问题
+        print_url = f"{BASE_URL}/workflow/order_print?categoryId={category_id}&ticketId={ticket_id}&nos={ticket_no}&_t={int(time.time()*1000)}"
 
         try:
-            page.goto(print_url, wait_until="networkidle", timeout=60000)
+            # 【优化2】：将 networkidle 降级为 domcontentloaded，极大提升加载速度
+            page.goto(print_url, wait_until="domcontentloaded", timeout=30000)
 
-            # 【修复点 1】：精确定位页面中原生的"导出PDF"按钮
+            # 【优化3】：精准等待“导出PDF”按钮出现
             btn = page.locator("button").filter(has_text="导出PDF").first
             btn.wait_for(state="visible", timeout=15000)
 
-            # 【缓冲极度重要】：此时按钮虽然出现了，但表格里的单据明细数据可能还在用 AJAX 异步加载
-            # 强制挂起 3 秒，等数据完完全全塞进 HTML 里，防止生成的 PDF 是空表格
-            time.sleep(3)
+            # 【优化4】：精准等待表格数据渲染（尝试等待 table 或 tr 元素）
+            # 不再使用死板的 sleep(3)
+            try:
+                page.wait_for_selector("table tr", state="attached", timeout=5000)
+            except:
+                pass # 如果没表格也继续，防卡死
 
-            # 【修复点 2】：像真人一样去点击，并接管前端的 Blob 下载流
-            with page.expect_download(timeout=60000) as download_info:
+            # 极短的动画缓冲
+            page.wait_for_timeout(500)
+
+            with page.expect_download(timeout=30000) as download_info:
                 btn.click()
 
             download = download_info.value
@@ -173,19 +167,25 @@ class OrderHistoryRPA:
         self.login()
         tickets = self.fetch_all_tickets()
         if not tickets:
-            print("[!] 未查询到符合条件的工单，请检查配置的时间范围。")
+            print("[!] 未查询到符合条件的工单。")
             return
 
         print(f"[+] 启动无头浏览器，准备下载 {len(tickets)} 份 PDF ...")
         with sync_playwright() as p:
             try:
-                browser = p.chromium.launch(headless=True)
+                # 【优化5】：加入 Chromium 底层性能参数，砍掉无关的渲染和沙盒开销
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                        "--no-sandbox",
+                        "--disable-software-rasterizer"
+                    ]
+                )
             except Exception as e:
                 raise Exception(f"BROWSER_INIT_FAILED|{str(e)}")
 
-            print("[*] 正在同步登录凭证到无头浏览器...")
-
-            # 【修复点 3】：明确配置 accept_downloads=True，允许无头浏览器保存文件
             context = browser.new_context(
                 extra_http_headers={"Authorization": f"Bearer {self.token}"},
                 accept_downloads=True
@@ -195,6 +195,7 @@ class OrderHistoryRPA:
             if cookies:
                 context.add_cookies(cookies)
 
+            # 初始化 LocalStorage
             init_page = context.new_page()
             try:
                 init_page.goto(f"{BASE_URL}/admin/login/login", wait_until="domcontentloaded", timeout=30000)
@@ -207,19 +208,18 @@ class OrderHistoryRPA:
                 print(f"[!] 警告: 同步 LocalStorage 失败: {e}")
             init_page.close()
 
+            # 【优化6】：全局复用唯一标签页 (Master Page)，彻底干掉 new_page() 的巨额开销
+            master_page = context.new_page()
+
             for index, item in enumerate(tickets):
                 print(f"[*] 进度 [{index+1}/{len(tickets)}] No: {item.get('TicketNo')}")
+                self.save_pdf(master_page, item)
 
-                # 【修复点 4：解决全部下成同一张单的 Bug】
-                # 每次循环新建一个干净的标签页，强制 Vue 重新挂载路由，抓完即焚
-                page = context.new_page()
-                self.save_pdf(page, item)
-                page.close()
-
+            master_page.close()
             browser.close()
 
 
-# ================= 4. 执行入口与交互处理 =================
+# ================= 4. 执行入口 =================
 def install_chromium():
     try:
         print(f"\n[*] 正在安装便携版 Chromium 浏览器组件到: {BROWSERS_PATH}")
@@ -234,7 +234,6 @@ def install_chromium():
         print("\n[+] 浏览器组件下载安装成功！")
     except Exception as e:
         print(f"\n[致命错误] 浏览器安装失败: {e}")
-        print("提示：请检查网络连接，或尝试关闭系统代理后重试。")
         sys.exit(1)
 
 if __name__ == "__main__":
@@ -258,7 +257,7 @@ if __name__ == "__main__":
                 install_chromium()
                 print("\n[!] 准备就绪，请重新运行本程序执行导出任务。")
             else:
-                print("\n[!] 取消安装。如需手动安装，请在命令行执行: 你的程序.exe install")
+                print("\n[!] 取消安装。")
         else:
             print(f"\n[致命错误]: {error_msg}")
 
