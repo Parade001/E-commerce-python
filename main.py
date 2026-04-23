@@ -6,6 +6,7 @@ import requests
 import configparser
 import subprocess
 from datetime import datetime
+from playwright.sync_api import sync_playwright
 
 # ================= 1. 核心环境劫持 =================
 if getattr(sys, 'frozen', False):
@@ -15,8 +16,6 @@ else:
 
 BROWSERS_PATH = os.path.join(PROG_DIR, "pw-browsers")
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_PATH
-
-from playwright.sync_api import sync_playwright
 
 # ================= 2. 配置加载 =================
 CONFIG_PATH = os.path.join(PROG_DIR, "config.ini")
@@ -36,6 +35,7 @@ try:
     RAW_PASSWORD = conf.get("Credentials", "password")
     START_TIME = conf.get("Query", "start_time")
     END_TIME = conf.get("Query", "end_time")
+    TARGET_CATEGORIES = conf.get("Query", "categories", fallback="全部").strip()
 except Exception as e:
     print(f"[错误] 读取 config.ini 格式失败: {e}")
     input("\n按回车键退出...")
@@ -55,6 +55,9 @@ class OrderHistoryRPA:
             "Origin": BASE_URL,
             "Referer": f"{BASE_URL}/"
         }
+
+        self.category_name_to_id = {}
+        self.category_id_to_name = {}
 
     def login(self):
         url = f"{BASE_URL}/admin/login/login"
@@ -82,24 +85,78 @@ class OrderHistoryRPA:
         except Exception as e:
             raise Exception(f"登录接口连接失败: {e}")
 
+    def fetch_category_map(self):
+        """同步真实的工单类型字典"""
+        print("[*] 正在同步系统工单类型字典...")
+        # 替换为真实的字典接口
+        dict_url = f"{BASE_URL}/workflow/setting_flow/List"
+
+        try:
+            resp = self.session.post(dict_url, json={}, headers=self.headers, timeout=15).json()
+            items = resp.get("TModel", [])
+            for item in items:
+                cid = item.get("CategoryId")
+                title = item.get("Title")
+                if cid is not None and title:
+                    self.category_name_to_id[title] = cid
+                    self.category_id_to_name[cid] = title
+            print(f"[+] 字典同步成功，共获取到 {len(self.category_name_to_id)} 种工单类型")
+        except Exception as e:
+            print(f"[!] 警告: 字典接口请求失败 ({e})，启用本地防灾静态字典...")
+            fallback_map = {
+                8: "赠品工单", 9: "发票工单", 10: "维修工单", 11: "退货退款工单", 12: "以货换货工单",
+                13: "换货补发工单", 14: "供应商补件工单", 15: "部分退款工单", 16: "自制配件工单",
+                17: "自制补件工单", 18: "投诉工单", 19: "催发货工单", 21: "差评工单", 23: "转保工单",
+                25: "补发工单", 26: "系统运维工单", 27: "物流提货测试工单", 46: "退货异常反馈工单",
+                47: "分销商售后", 48: "投诉催发", 49: "下沉售后工单", 50: "工商投诉工单", 51: "逾期判责工单",
+                52: "物流对接工单", 53: "物流异常反馈工单", 54: "国补异常登记工单", 55: "跨工厂发货登记工单",
+                56: "占货补发工单", 57: "物流散单发货工单", 58: "赠品异常稽查工单", 59: "格调补件工单", 60: "店铺罚款工单"
+            }
+            for cid, title in fallback_map.items():
+                self.category_id_to_name[cid] = title
+                self.category_name_to_id[title] = cid
+
     def fetch_all_tickets(self):
+        """获取工单列表，支持动态组装查询参数"""
         url = f"{BASE_URL}/workflow/order_history/List"
         all_items = []
         page_index = 1
         page_size = 50
         total_pages = 1
 
+        # 1. 动态生成 CategoryId 的 Filter 节点
+        target_ids = []
+        if TARGET_CATEGORIES == "全部":
+            # 如果是全部，将字典中所有的 ID 提取出来
+            target_ids = [str(cid) for cid in self.category_id_to_name.keys()]
+        else:
+            # 如果是部分，按逗号分割匹配
+            target_names = [n.strip() for n in TARGET_CATEGORIES.split(",")]
+            for name in target_names:
+                if name in self.category_name_to_id:
+                    target_ids.append(str(self.category_name_to_id[name]))
+                else:
+                    print(f"[!] 忽略未知的工单类型: {name}")
+
+        base_filters = []
+        if target_ids:
+            ids_str = f"({','.join(target_ids)})"
+            base_filters.append({"Field": "CategoryId", "Value": ids_str, "Operator": "in", "Connector": "and"})
+
+        # 2. 追加固定的日期、状态等 Filter 节点 (严格对齐抓包顺序)
+        base_filters.extend([
+            {"Field": "Status", "Value": "(10,20,30)", "Operator": "in", "Connector": "and"},
+            {"Field": "CreateTimeStart", "Value": START_TIME, "Operator": ">=", "Connector": "and"},
+            {"Field": "CreateTimeEnd", "Value": END_TIME, "Operator": "<=", "Connector": "and"},
+            {"Field": "MyTicket", "Value": 1, "Operator": "=", "Connector": "and"}
+        ])
+
         while page_index <= total_pages:
             payload = {
                 "PageIndex": page_index,
                 "PageSize": page_size,
                 "Sort": [{"Field": "TicketId", "Value": "DESC"}],
-                "Filter": [
-                    {"Field": "Status", "Value": "(10,20,30)", "Operator": "in", "Connector": "and"},
-                    {"Field": "CreateTimeStart", "Value": START_TIME, "Operator": ">=", "Connector": "and"},
-                    {"Field": "CreateTimeEnd", "Value": END_TIME, "Operator": "<=", "Connector": "and"},
-                    {"Field": "MyTicket", "Value": 1, "Operator": "=", "Connector": "and"}
-                ]
+                "Filter": base_filters
             }
 
             resp = self.session.post(url, json=payload, headers=self.headers).json()
@@ -118,6 +175,7 @@ class OrderHistoryRPA:
         return all_items
 
     def save_pdf(self, page, item):
+        """调用无头浏览器底层点击下载原生 PDF"""
         ticket_id = item.get("TicketId")
         category_id = item.get("CategoryId")
         ticket_no = str(item.get("TicketNo") or f"T{int(time.time())}").strip()
@@ -126,45 +184,51 @@ class OrderHistoryRPA:
 
         if not ticket_id: return
 
+        # 反查字典获取中文工单类型，建立三级目录
+        category_title = self.category_id_to_name.get(category_id, f"未知类型({category_id})")
+
+        safe_type = category_title.replace('/', '_').replace('\\', '_')
         safe_resp = resp_name.replace('/', '_').replace('\\', '_')
         safe_reason = reason_one.replace('/', '_').replace('\\', '_')
 
-        folder_path = os.path.join(PROG_DIR, "工单导出结果", safe_resp, safe_reason)
+        folder_path = os.path.join(PROG_DIR, "工单导出结果", safe_type, safe_resp, safe_reason)
         os.makedirs(folder_path, exist_ok=True)
         file_path = os.path.join(folder_path, f"{ticket_no}.pdf")
 
-        # 【优化1】：加入时间戳，强制打破 Vue 路由缓存，解决同一页面问题
+        # 追加时间戳，彻底打破 Vue 单页路由缓存
         print_url = f"{BASE_URL}/workflow/order_print?categoryId={category_id}&ticketId={ticket_id}&nos={ticket_no}&_t={int(time.time()*1000)}"
 
         try:
-            # 【优化2】：将 networkidle 降级为 domcontentloaded，极大提升加载速度
             page.goto(print_url, wait_until="domcontentloaded", timeout=30000)
 
-            # 【优化3】：精准等待“导出PDF”按钮出现
+            # 精确定位页面原生的【导出PDF】按钮
             btn = page.locator("button").filter(has_text="导出PDF").first
             btn.wait_for(state="visible", timeout=15000)
 
-            # 【优化4】：精准等待表格数据渲染（尝试等待 table 或 tr 元素）
-            # 不再使用死板的 sleep(3)
             try:
                 page.wait_for_selector("table tr", state="attached", timeout=5000)
             except:
-                pass # 如果没表格也继续，防卡死
+                pass
 
-            # 极短的动画缓冲
+                # 给前端渲染组件留出极短的 0.5 秒缓冲
             page.wait_for_timeout(500)
 
+            # 接管原生下载流，抛弃 page.pdf() 的截图逻辑
             with page.expect_download(timeout=30000) as download_info:
                 btn.click()
 
             download = download_info.value
             download.save_as(file_path)
-            print(f"    [成功] {safe_resp} > {safe_reason} > {ticket_no}")
+            print(f"    [成功] {safe_type} > {safe_resp} > {safe_reason} > {ticket_no}")
         except Exception as e:
             print(f"    [失败] 工单 {ticket_no}: {e}")
 
     def run(self):
         self.login()
+        # 1. 启动前先同步系统分类字典
+        self.fetch_category_map()
+
+        # 2. 抓取所需工单
         tickets = self.fetch_all_tickets()
         if not tickets:
             print("[!] 未查询到符合条件的工单。")
@@ -173,7 +237,6 @@ class OrderHistoryRPA:
         print(f"[+] 启动无头浏览器，准备下载 {len(tickets)} 份 PDF ...")
         with sync_playwright() as p:
             try:
-                # 【优化5】：加入 Chromium 底层性能参数，砍掉无关的渲染和沙盒开销
                 browser = p.chromium.launch(
                     headless=True,
                     args=[
@@ -195,7 +258,6 @@ class OrderHistoryRPA:
             if cookies:
                 context.add_cookies(cookies)
 
-            # 初始化 LocalStorage
             init_page = context.new_page()
             try:
                 init_page.goto(f"{BASE_URL}/admin/login/login", wait_until="domcontentloaded", timeout=30000)
@@ -208,7 +270,7 @@ class OrderHistoryRPA:
                 print(f"[!] 警告: 同步 LocalStorage 失败: {e}")
             init_page.close()
 
-            # 【优化6】：全局复用唯一标签页 (Master Page)，彻底干掉 new_page() 的巨额开销
+            # 复用单标签页以压榨最大性能
             master_page = context.new_page()
 
             for index, item in enumerate(tickets):
@@ -217,7 +279,6 @@ class OrderHistoryRPA:
 
             master_page.close()
             browser.close()
-
 
 # ================= 4. 执行入口 =================
 def install_chromium():
