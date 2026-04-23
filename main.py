@@ -57,10 +57,20 @@ class OrderHistoryRPA:
     def __init__(self):
         self.session = requests.Session()
         self.token = ""
-        self.headers = {"Content-Type": "application/json"}
+        # [核心修复]：添加完整的浏览器请求头，伪装成真实用户，防止被服务端的防火墙/反爬策略挂起
+        self.headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Origin": BASE_URL,
+            "Referer": f"{BASE_URL}/"
+        }
 
     def login(self):
+        """登录并自动处理密码加密"""
         url = f"{BASE_URL}/admin/login/login"
+
+        # 自动将明文密码转化为 MD5 密文
         md5_obj = hashlib.md5()
         md5_obj.update(RAW_PASSWORD.encode('utf-8'))
         encrypted_pwd = md5_obj.hexdigest()
@@ -75,9 +85,11 @@ class OrderHistoryRPA:
 
         print(f"[*] 正在登录账号: {ACCOUNT} ...")
         try:
-            resp = self.session.post(url, json=payload, timeout=15).json()
+            # [核心修复]：将 timeout 延长到 60 秒，防止复杂账号权限校验导致超时假死
+            resp = self.session.post(url, json=payload, headers=self.headers, timeout=60).json()
             if resp.get("IsSuccess"):
                 self.token = resp["TModel"]["Token"]
+                # 登录成功后，更新全局 header，附带 Token
                 self.headers["Authorization"] = f"Bearer {self.token}"
                 print("[+] 登录成功")
             else:
@@ -86,6 +98,7 @@ class OrderHistoryRPA:
             raise Exception(f"登录接口连接失败: {e}")
 
     def fetch_all_tickets(self):
+        """获取全量工单，基于 PageCount 进行精确分页"""
         url = f"{BASE_URL}/workflow/order_history/List"
         all_items = []
         page_index = 1
@@ -99,9 +112,9 @@ class OrderHistoryRPA:
                 "Sort": [{"Field": "TicketId", "Value": "DESC"}],
                 "Filter": [
                     {"Field": "Status", "Value": "(10,20,30)", "Operator": "in", "Connector": "and"},
-                    {"Field": "CategoryId", "Value": "(10,11,12,13,14,15,18,21,17)", "Operator": "in", "Connector": "and"},
                     {"Field": "CreateTimeStart", "Value": START_TIME, "Operator": ">=", "Connector": "and"},
                     {"Field": "CreateTimeEnd", "Value": END_TIME, "Operator": "<=", "Connector": "and"},
+                    # [核心修复] 严格对齐你提供的浏览器 JSON，如果你在浏览器里带了 MyTicket 就留着，没带就删掉
                     {"Field": "MyTicket", "Value": 1, "Operator": "=", "Connector": "and"}
                 ]
             }
@@ -128,6 +141,7 @@ class OrderHistoryRPA:
         return all_items
 
     def save_pdf(self, page, item):
+        """导出PDF并按责任原因分类"""
         ticket_id = item.get("TicketId")
         category_id = item.get("CategoryId")
         ticket_no = str(item.get("TicketNo") or f"T{int(time.time())}").strip()
@@ -136,6 +150,7 @@ class OrderHistoryRPA:
 
         if not ticket_id: return
 
+        # 清洗非法字符，防止 Windows/Mac 建文件夹报错
         safe_resp = resp_name.replace('/', '_').replace('\\', '_')
         safe_reason = reason_one.replace('/', '_').replace('\\', '_')
 
@@ -146,8 +161,9 @@ class OrderHistoryRPA:
         print_url = f"{BASE_URL}/workflow/order_print?categoryId={category_id}&ticketId={ticket_id}&nos={ticket_no}"
 
         try:
+            # 同样可适当延长页面加载超时时间
             page.goto(print_url, wait_until="networkidle", timeout=60000)
-            time.sleep(1)
+            time.sleep(1) # 等待样式渲染
             page.pdf(path=file_path, format="A4", print_background=True)
             print(f"    [成功] {safe_resp} > {safe_reason} > {ticket_no}")
         except Exception as e:
@@ -180,6 +196,7 @@ class OrderHistoryRPA:
 
 # ================= 4. 执行入口与交互处理 =================
 def install_chromium():
+    """自动化安装 Chromium 浏览器内核"""
     try:
         print(f"\n[*] 正在安装便携版 Chromium 浏览器组件到: {BROWSERS_PATH}")
         print("[*] 文件体积较大（约 100MB+），请耐心等待...")
