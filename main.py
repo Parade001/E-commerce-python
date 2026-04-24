@@ -17,7 +17,7 @@ else:
 BROWSERS_PATH = os.path.join(PROG_DIR, "pw-browsers")
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_PATH
 
-# ================= 2. 配置加载与 9大参数解耦 =================
+# ================= 2. 配置加载与参数解耦 =================
 CONFIG_PATH = os.path.join(PROG_DIR, "config.ini")
 
 def load_config():
@@ -37,7 +37,16 @@ try:
     END_TIME = conf.get("Query", "end_time")
     TARGET_CATEGORIES = conf.get("Query", "categories", fallback="全部").strip()
 
-    # 【核心新增】一次性加载 9 个布尔值查询开关
+    # 【核心新增】读取 5 个工单状态开关
+    STATUS_FLAGS = {
+        "0": conf.get("Query", "status_0", fallback="1").strip(),
+        "10": conf.get("Query", "status_10", fallback="1").strip(),
+        "20": conf.get("Query", "status_20", fallback="1").strip(),
+        "30": conf.get("Query", "status_30", fallback="1").strip(),
+        "40": conf.get("Query", "status_40", fallback="1").strip(),
+    }
+
+    # 一次性加载 9 个布尔值查询开关
     QUERY_FLAGS = {
         "MyTicket": conf.get("Query", "my_ticket", fallback="0").strip(),
         "IsAbnormal": conf.get("Query", "is_abnormal", fallback="0").strip(),
@@ -149,14 +158,22 @@ class OrderHistoryRPA:
             ids_str = f"({','.join(target_ids)})"
             base_filters.append({"Field": "CategoryId", "Value": ids_str, "Operator": "in", "Connector": "and"})
 
-        # 2. 追加固定的日期、状态等 Filter 节点
+        # 2. 动态组装 5个工单状态节点
+        active_statuses = [k for k, v in STATUS_FLAGS.items() if v == "1"]
+        if active_statuses:
+            status_str = f"({','.join(active_statuses)})"
+            base_filters.append({"Field": "Status", "Value": status_str, "Operator": "in", "Connector": "and"})
+            print(f"[*] 当前限定的工单状态: {status_str}")
+        else:
+            print("[!] 警告: 未勾选任何工单状态开关，可能导致查询不到数据！")
+
+        # 3. 追加固定的日期 Filter 节点
         base_filters.extend([
-            {"Field": "Status", "Value": "(10,20,30,40)", "Operator": "in", "Connector": "and"},
             {"Field": "CreateTimeStart", "Value": START_TIME, "Operator": ">=", "Connector": "and"},
             {"Field": "CreateTimeEnd", "Value": END_TIME, "Operator": "<=", "Connector": "and"}
         ])
 
-        # 3. 【核心新增】遍历 QUERY_FLAGS 字典，动态判定并拼装 9 个条件开关
+        # 4. 遍历 QUERY_FLAGS 字典，动态判定并拼装 9 个条件开关
         active_flags = []
         for field, value in QUERY_FLAGS.items():
             if value == "1":
@@ -164,9 +181,7 @@ class OrderHistoryRPA:
                 active_flags.append(field)
 
         if active_flags:
-            print(f"[*] 当前生效的附加属性过滤: {', '.join(active_flags)}")
-        else:
-            print("[*] 当前未启用任何附加属性过滤 (查全量)")
+            print(f"[*] 当前生效的高级过滤项: {', '.join(active_flags)}")
 
         while page_index <= total_pages:
             payload = {
