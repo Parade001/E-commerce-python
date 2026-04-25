@@ -37,7 +37,9 @@ try:
     END_TIME = conf.get("Query", "end_time")
     TARGET_CATEGORIES = conf.get("Query", "categories", fallback="全部").strip()
 
-    # 【核心新增】读取 5 个工单状态开关
+    # 【责任方读取】
+    RESPONSIBLE_NAME = conf.get("Query", "responsible_name", fallback="全部").strip()
+
     STATUS_FLAGS = {
         "0": conf.get("Query", "status_0", fallback="1").strip(),
         "10": conf.get("Query", "status_10", fallback="1").strip(),
@@ -46,7 +48,6 @@ try:
         "40": conf.get("Query", "status_40", fallback="1").strip(),
     }
 
-    # 一次性加载 9 个布尔值查询开关
     QUERY_FLAGS = {
         "MyTicket": conf.get("Query", "my_ticket", fallback="0").strip(),
         "IsAbnormal": conf.get("Query", "is_abnormal", fallback="0").strip(),
@@ -143,8 +144,10 @@ class OrderHistoryRPA:
         page_size = 50
         total_pages = 1
 
-        # 1. 动态生成 CategoryId 的 Filter 节点
+        base_filters = []
         target_ids = []
+
+        # 1. 工单类型限定
         if TARGET_CATEGORIES == "全部":
             target_ids = [str(cid) for cid in self.category_id_to_name.keys()]
         else:
@@ -153,35 +156,38 @@ class OrderHistoryRPA:
                 if name in self.category_name_to_id:
                     target_ids.append(str(self.category_name_to_id[name]))
 
-        base_filters = []
         if target_ids:
             ids_str = f"({','.join(target_ids)})"
             base_filters.append({"Field": "CategoryId", "Value": ids_str, "Operator": "in", "Connector": "and"})
 
-        # 2. 动态组装 5个工单状态节点
+        # 2. 工单状态限定
         active_statuses = [k for k, v in STATUS_FLAGS.items() if v == "1"]
         if active_statuses:
             status_str = f"({','.join(active_statuses)})"
             base_filters.append({"Field": "Status", "Value": status_str, "Operator": "in", "Connector": "and"})
-            print(f"[*] 当前限定的工单状态: {status_str}")
-        else:
-            print("[!] 警告: 未勾选任何工单状态开关，可能导致查询不到数据！")
 
-        # 3. 追加固定的日期 Filter 节点
+        # 3. 日期限定
         base_filters.extend([
             {"Field": "CreateTimeStart", "Value": START_TIME, "Operator": ">=", "Connector": "and"},
             {"Field": "CreateTimeEnd", "Value": END_TIME, "Operator": "<=", "Connector": "and"}
         ])
 
-        # 4. 遍历 QUERY_FLAGS 字典，动态判定并拼装 9 个条件开关
-        active_flags = []
+        # 4. 业务状态限定
         for field, value in QUERY_FLAGS.items():
             if value == "1":
                 base_filters.append({"Field": field, "Value": 1, "Operator": "=", "Connector": "and"})
-                active_flags.append(field)
 
-        if active_flags:
-            print(f"[*] 当前生效的高级过滤项: {', '.join(active_flags)}")
+        # 5. 【核心回退：责任方单选策略】
+        if RESPONSIBLE_NAME != "全部":
+            base_filters.append({
+                "Field": "ResponsibleName",
+                "Value": RESPONSIBLE_NAME,
+                "Operator": "=",
+                "Connector": "and"
+            })
+            print(f"[*] 当前限定的责任方: {RESPONSIBLE_NAME}")
+        else:
+            print("[*] 责任方: 不限制 (查全部)")
 
         while page_index <= total_pages:
             payload = {
@@ -200,8 +206,9 @@ class OrderHistoryRPA:
 
             t_model = resp.get("TModel")
             items = t_model if isinstance(t_model, list) else (t_model.get("Items", []) if t_model else [])
+
             all_items.extend(items)
-            print(f"[*] 正在抓取第 {page_index}/{total_pages} 页数据...")
+            print(f"[*] 正在抓取第 {page_index}/{total_pages} 页数据... (本页记录: {len(items)} 条)")
             page_index += 1
 
         return all_items
@@ -210,8 +217,10 @@ class OrderHistoryRPA:
         ticket_id = item.get("TicketId")
         category_id = item.get("CategoryId")
         ticket_no = str(item.get("TicketNo") or f"T{int(time.time())}").strip()
-        resp_name = str(item.get("ResponsibleName") or "未分类").strip()
-        reason_one = str(item.get("ReasonOne") or "其他原因").strip()
+
+        # 严谨获取责任方与原因
+        resp_name = str(item.get("ResponsibleName") or "").strip() or "未分类"
+        reason_one = str(item.get("ReasonOne") or "").strip() or "其他原因"
 
         if not ticket_id: return
 
