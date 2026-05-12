@@ -213,7 +213,7 @@ class OrderHistoryRPA:
 
         return all_items
 
-    def save_pdf(self, page, item):
+    def save_pdf(self, page, item, max_retries=3):
         ticket_id = item.get("TicketId")
         category_id = item.get("CategoryId")
         ticket_no = str(item.get("TicketNo") or f"T{int(time.time())}").strip()
@@ -235,27 +235,58 @@ class OrderHistoryRPA:
 
         print_url = f"{BASE_URL}/workflow/order_print?categoryId={category_id}&ticketId={ticket_id}&nos={ticket_no}&_t={int(time.time()*1000)}"
 
-        try:
-            page.goto(print_url, wait_until="domcontentloaded", timeout=30000)
-
-            btn = page.locator("button").filter(has_text="导出PDF").first
-            btn.wait_for(state="visible", timeout=15000)
-
+        for attempt in range(max_retries):
             try:
-                page.wait_for_selector("table tr", state="attached", timeout=5000)
-            except:
-                pass
+                # 1. 导航并强制等待网络连接清空，降低 DOM 未渲染概率
+                # 注意：如果你们的页面存在不断的心跳包导致超时，将 networkidle 改为 load
+                page.goto(print_url, wait_until="networkidle", timeout=30000)
 
-            page.wait_for_timeout(500)
+                # 2. 等待导出按钮可用
+                btn = page.locator("button").filter(has_text="导出PDF").first
+                btn.wait_for(state="visible", timeout=15000)
 
-            with page.expect_download(timeout=30000) as download_info:
-                btn.click()
+                # 3. 业务特征等待：等待数据表格渲染完成
+                try:
+                    page.wait_for_selector("table tr", state="visible", timeout=5000)
+                except Exception:
+                    pass # 容忍表格不存在的特殊工单
 
-            download = download_info.value
-            download.save_as(file_path)
-            print(f"    [成功] {safe_type} > {safe_resp} > {safe_reason} > {ticket_no}")
-        except Exception as e:
-            print(f"    [失败] 工单 {ticket_no}: {e}")
+                # 4. 关键：给浏览器前端 Canvas 渲染引擎留出强行的 CPU 绘图时间
+                page.wait_for_timeout(1500)
+
+                # 5. 触发并拦截下载流 (依然兼容你们前端纯 JS 生成文件的逻辑)
+                with page.expect_download(timeout=30000) as download_info:
+                    btn.click()
+
+                download = download_info.value
+                download.save_as(file_path)
+
+                # 6. 结果验伪：如果文件过小（设定阈值 5KB），说明抓到了未渲染完的骨架屏或空白页
+                if os.path.exists(file_path):
+                    file_size = os.path.getsize(file_path)
+                    if file_size < 5120:  # 5KB = 5120 Bytes
+                        os.remove(file_path) # 销毁无效文件
+                        raise Exception(f"文件体积异常 ({file_size} 字节)，判定为空白渲染页")
+                else:
+                    raise Exception("下载流结束但文件未落盘")
+
+                print(f"    [成功] {safe_type} > {safe_resp} > {safe_reason} > {ticket_no} (尝试: {attempt+1}/{max_retries})")
+                return # 成功则退出循环，不再重试
+
+            except Exception as e:
+                # 失败路径处理：触发重试机制
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 2  # 指数退避：2s, 4s...
+                    print(f"    [警告] 工单 {ticket_no} 抓取异常 ({str(e)})，{wait_time}秒后执行第 {attempt+2} 次重试...")
+                    time.sleep(wait_time)
+
+                    # 状态重置：清空当前页面状态，防止上一次的异常 DOM 缓存干扰下一次抓取
+                    try:
+                        page.goto("about:blank")
+                    except:
+                        pass
+                else:
+                    print(f"    [致命失败] 工单 {ticket_no} 达到最大重试次数 ({max_retries})，最终放弃。错误信息: {e}")
 
     def run(self):
         self.login()
